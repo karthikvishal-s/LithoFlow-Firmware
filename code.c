@@ -1,103 +1,127 @@
 #include <Wire.h> 
 #include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
-#include "HX711.h"
 
 // --- CONFIGURATION ---
-#define EEPROM_SIZE 8          // Space for float (intake)
+#define EEPROM_SIZE 8          
 #define LOADCELL_DOUT_PIN 19
 #define LOADCELL_SCK_PIN 18
-#define LIFT_THRESHOLD 30.0    // Weight drop to trigger "Drinking" mode (grams)
-#define DRINK_MINIMUM 10.0     // Minimum weight change to count as a drink (grams)
+#define LIFT_THRESHOLD 30.0    
+#define DRINK_MINIMUM 10.0     
 
-// Initialize LCD (Address 0x27 or 0x3F) and Scale
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-HX711 scale;
 
 // --- GLOBAL VARIABLES ---
 float total_intake = 0.0;
 float last_stable_weight = 0.0;
 bool is_lifting = false;
-float calibration_factor = -420.0; // REPLACE THIS after your calibration test
+float calibration_factor = -420.0; 
+long zero_offset = 0; // Manual tare value
+
+// --- CUSTOM HX711 DRIVER (BIT-BANGING) ---
+long readHX711Raw() {
+  while (digitalRead(LOADCELL_DOUT_PIN) == HIGH); // Wait for data ready
+
+  long count = 0;
+  for (int i = 0; i < 24; i++) {
+    digitalWrite(LOADCELL_SCK_PIN, HIGH);
+    count = count << 1; 
+    digitalWrite(LOADCELL_SCK_PIN, LOW);
+    if (digitalRead(LOADCELL_DOUT_PIN)) count++; 
+  }
+
+  // 25th pulse: Set Gain to 128 for next reading
+  digitalWrite(LOADCELL_SCK_PIN, HIGH);
+  count = count ^ 0x800000; // Convert 2's complement
+  digitalWrite(LOADCELL_SCK_PIN, LOW);
+
+  return count;
+}
+
+float getWeightUnits(int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += (readHX711Raw() - zero_offset);
+  }
+  return (float)(sum / samples) / calibration_factor;
+}
 
 void setup() {
   Serial.begin(115200);
   
-  // 1. DATABASE SETUP: Load saved intake from Flash
+  // 1. PIN MODES FOR CUSTOM DRIVER
+  pinMode(LOADCELL_DOUT_PIN, INPUT);
+  pinMode(LOADCELL_SCK_PIN, OUTPUT);
+
+  // 2. LOCAL DATABASE SETUP
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(0, total_intake);
   if (isnan(total_intake) || total_intake < 0) total_intake = 0.0; 
 
-  // 2. INTERFACE SETUP: LCD and HX711
+  // 3. INTERFACE SETUP
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
   lcd.print("Litho-Flow KVS");
   
-  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-  scale.set_scale(calibration_factor); 
-  scale.tare(); // Resets scale to 0 on startup
+  // 4. MANUAL TARE (Zeroing the scale)
+  delay(1000);
+  long tare_sum = 0;
+  for(int i=0; i<10; i++) tare_sum += readHX711Raw();
+  zero_offset = tare_sum / 10;
   
-  delay(2000); 
-  last_stable_weight = scale.get_units(10); // Set initial baseline weight
-  Serial.println("System Ready.");
+  delay(1000); 
+  last_stable_weight = getWeightUnits(10); 
+  Serial.println("System Ready (Custom Driver).");
 }
 
 void loop() {
-  // EDGE ANALYTICS: Use filtering to stabilize reading
-  float current_reading = scale.get_units(5);
+  // 5. EDGE ANALYTICS: Noise filtering
+  float current_reading = getWeightUnits(5);
 
-  // --- SERIAL MONITOR DEBUGGING ---
   Serial.print("Weight: "); Serial.print(current_reading, 1);
-  Serial.print("g | Baseline: "); Serial.print(last_stable_weight, 1);
   Serial.print("g | Total: "); Serial.print(total_intake, 1);
   Serial.println("ml");
 
-  // 3. LOGIC: CONSTANT BASELINE UPDATE
-  // If weight is stable and bottle is on the base, keep updating the baseline
+  // 6. BASELINE UPDATE LOGIC
   if (current_reading > (last_stable_weight * 0.8) && !is_lifting) {
     last_stable_weight = current_reading;
   }
 
-  // 4. LOGIC: LIFT DETECTION
-  // If weight drops significantly, user has picked up the bottle
+  // 7. LIFT DETECTION (FEATURE EXTRACTION)
   if (current_reading < LIFT_THRESHOLD && !is_lifting) { 
     is_lifting = true;
     lcd.setCursor(0, 1);
     lcd.print("Drinking...     ");
   } 
 
-  // 5. LOGIC: REPLACEMENT & CONSUMPTION CALCULATION
-  // If weight returns, wait for stability and calculate intake
+  // 8. PROCESSING DRINK EVENTS
   if (current_reading > (LIFT_THRESHOLD + 20.0) && is_lifting) {
     lcd.setCursor(0, 1);
     lcd.print("Processing...   ");
     
-    delay(4000); // SIGNAL CONDITIONING: Wait for water to stop sloshing
-    float new_weight = scale.get_units(15); // Average 15 samples for accuracy
-    
+    delay(4000); // Signal Conditioning: sloshing wait
+    float new_weight = getWeightUnits(15); 
     float consumed = last_stable_weight - new_weight;
     
     if (consumed > DRINK_MINIMUM) { 
       total_intake += consumed;
       
-      // DATABASE WRITE: Persist data to EEPROM
+      // PERSISTENCE DEMO: Save to Flash
       EEPROM.put(0, total_intake);
       EEPROM.commit(); 
       
-      last_stable_weight = new_weight; // Update baseline to new lower weight
+      last_stable_weight = new_weight; 
     }
     is_lifting = false;
   }
 
-  // --- DISPLAY UPDATES (GUI PROTOTYPE) ---
-  // Row 0: Daily Progress
+  // 9. GUI PROTOTYPE
   lcd.setCursor(0, 0);
   lcd.print("Intake: ");
   lcd.print(total_intake, 0);
   lcd.print(" ml    ");
 
-  // Row 1: Real-time Weight (only shown when bottle is on the base)
   if (!is_lifting) {
     lcd.setCursor(0, 1);
     lcd.print("Weight: ");
