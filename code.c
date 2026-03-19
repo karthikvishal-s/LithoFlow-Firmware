@@ -4,12 +4,13 @@
 #include <Wire.h> 
 #include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
+#include <WiFiClientSecure.h>
 
 // --- CONFIGURATION ---
 const char* ssid = "KarthikVishal"; 
 const char* password = "12345678";
-const char* serverName = "https://francina-increasable-brecken.ngrok-free.dev/api/telemetry"; 
-const char* resetServerName = "https://francina-increasable-brecken.ngrok-free.dev/api/reset"; 
+const char* serverName = "https://punier-bettie-straightly.ngrok-free.dev/api/telemetry"; 
+const char* resetServerName = "https://punier-bettie-straightly.ngrok-free.dev/api/reset"; 
 
 #define LOADCELL_DOUT_PIN 19
 #define LOADCELL_SCK_PIN 18
@@ -53,22 +54,32 @@ float getWeightUnits(int samples) {
 }
 
 // --- CLOUD SYNC ---
-void sendDataToCloud(float intake, float sip) {
+void sendDataToCloud(float intake, float sip, String tag) {
   if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure(); // Fixes SSL -1 error
+    
     HTTPClient http;
-    http.begin(serverName);
+    http.begin(client, serverName); // Use the secure client
+    
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("ngrok-skip-browser-warning", "true"); // Fixes ngrok -1 error
 
     StaticJsonDocument<200> doc;
     doc["total_intake"] = (int)intake;
     doc["last_sip"] = (int)sip;
-    doc["current_weight"] = (int)getWeightUnits(1);
+    doc["tag"] = tag;
 
     String requestBody;
     serializeJson(doc, requestBody);
-
+    
     int httpResponseCode = http.POST(requestBody);
-    Serial.print("[CLOUD] Sync Response: "); Serial.println(httpResponseCode);
+    
+    if (httpResponseCode > 0) {
+      Serial.printf("[CLOUD] Success! Response: %d\n", httpResponseCode);
+    } else {
+      Serial.printf("[CLOUD] Error: %s\n", http.errorToString(httpResponseCode).c_str());
+    }
     http.end();
   }
 }
@@ -88,8 +99,14 @@ void handlePhysicalReset() {
   // 2. Wipe Cloud Data
   if (WiFi.status() == WL_CONNECTED) {
     lcd.setCursor(0,1); lcd.print("Clearing Cloud...");
+    
+    // FIX: Use secure client for the HTTPS ngrok endpoint
+    WiFiClientSecure client;
+    client.setInsecure(); 
+    
     HTTPClient http;
-    http.begin(resetServerName);
+    http.begin(client, resetServerName);
+    
     int httpResponseCode = http.POST(""); // Empty body for POST
     Serial.print("[CLOUD] Reset Response: "); Serial.println(httpResponseCode);
     http.end();
@@ -188,7 +205,10 @@ void loop() {
       total_intake += consumed;
       EEPROM.put(0, total_intake);
       EEPROM.commit(); 
-      sendDataToCloud(total_intake, consumed);
+      
+      // FIX: Added the "hydration_event" tag here
+      sendDataToCloud(total_intake, consumed, "hydration_event");
+      
       last_stable_weight = new_weight; // Update baseline to current water level
     } 
     // Refill detected (negative change > 50g)
