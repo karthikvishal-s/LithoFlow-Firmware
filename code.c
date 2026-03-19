@@ -1,36 +1,45 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h> 
 #include <Wire.h> 
 #include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
-#include <WiFiClientSecure.h>
+#include <EloquentTinyML.h>
+#include "model.h" // This must contain the 'lithoflow_edge_tflite' array
 
-// --- CONFIGURATION ---
-const char* ssid = "KarthikVishal"; 
-const char* password = "12345678";
-const char* serverName = "https://punier-bettie-straightly.ngrok-free.dev/api/telemetry"; 
-const char* resetServerName = "https://punier-bettie-straightly.ngrok-free.dev/api/reset"; 
+// --- NETWORK CONFIG ---
+const char* ssid = "YOUR_WIFI_NAME"; 
+const char* password = "YOUR_WIFI_PASSWORD";
+// IMPORTANT: Use https and ensure NO trailing slash if your Next.js route doesn't have one
+const char* serverName = "https://YOUR_NGROK_URL.ngrok-free.dev/api/telemetry"; 
 
+// --- PINS & HARDWARE ---
 #define LOADCELL_DOUT_PIN 19
 #define LOADCELL_SCK_PIN 18
-#define RESET_BTN_PIN 4 // NEW: Connect button between Pin 4 and GND
-#define EEPROM_SIZE 8
+#define EEPROM_SIZE 8 // To store total_intake (float)
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// --- GLOBAL VARIABLES ---
+// --- TINYML CONFIG ---
+#define NUMBER_OF_INPUTS 2   // [Weight Drop, Duration]
+#define NUMBER_OF_OUTPUTS 1  // Probability of "Real Sip"
+#define TENSOR_ARENA_SIZE 2 * 1024
+Eloquent::TinyML::TfLite<NUMBER_OF_INPUTS, NUMBER_OF_OUTPUTS, TENSOR_ARENA_SIZE> ml;
+
+// --- STATE VARIABLES ---
 float total_intake = 0.0;
 float last_stable_weight = 0.0;
 bool is_lifting = false;
-float calibration_factor = -420.0; 
+unsigned long lift_start_time = 0;
+float calibration_factor = -420.0; // Calibrate this for your specific load cell
 long zero_offset = 0;
 
-// --- CUSTOM HX711 DRIVER ---
+// --- HX711 BIT-BANGING DRIVER ---
 long readHX711Raw() {
   while (digitalRead(LOADCELL_DOUT_PIN) == HIGH); 
   long count = 0;
-  portDISABLE_INTERRUPTS(); // Protect timing from Wi-Fi tasks
+  portDISABLE_INTERRUPTS(); 
   for (int i = 0; i < 24; i++) {
     digitalWrite(LOADCELL_SCK_PIN, HIGH);
     count = count << 1; 
@@ -53,30 +62,31 @@ float getWeightUnits(int samples) {
   return (float)(sum / samples) / calibration_factor;
 }
 
-// --- CLOUD SYNC ---
+// --- CLOUD TELEMETRY (FIXED FOR -1 AND 308 ERRORS) ---
 void sendDataToCloud(float intake, float sip, String tag) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClientSecure client;
-    client.setInsecure(); // Fixes SSL -1 error
+    client.setInsecure(); // Required for ngrok HTTPS - fixes Error -1
     
     HTTPClient http;
-    http.begin(client, serverName); // Use the secure client
+    http.begin(client, serverName);
     
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("ngrok-skip-browser-warning", "true"); // Fixes ngrok -1 error
+    http.addHeader("ngrok-skip-browser-warning", "true"); // Bypasses ngrok gateway page
 
     StaticJsonDocument<200> doc;
-    doc["total_intake"] = (int)intake;
-    doc["last_sip"] = (int)sip;
+    doc["total_intake"] = intake;
+    doc["last_sip"] = sip;
     doc["tag"] = tag;
 
     String requestBody;
     serializeJson(doc, requestBody);
     
+    Serial.println("[CLOUD] POSTing to " + String(serverName));
     int httpResponseCode = http.POST(requestBody);
     
     if (httpResponseCode > 0) {
-      Serial.printf("[CLOUD] Success! Response: %d\n", httpResponseCode);
+      Serial.printf("[CLOUD] Success: %d\n", httpResponseCode);
     } else {
       Serial.printf("[CLOUD] Error: %s\n", http.errorToString(httpResponseCode).c_str());
     }
@@ -84,151 +94,85 @@ void sendDataToCloud(float intake, float sip, String tag) {
   }
 }
 
-// --- NEW: FULL STACK RESET ---
-void handlePhysicalReset() {
-  lcd.clear();
-  lcd.setCursor(0,0); lcd.print("RESETTING SYSTEM ");
-  Serial.println("\n[HARDWARE] Manual Reset Triggered!");
+void setup() {
+  Serial.begin(115200);
+  
+  // 1. WiFi Connection
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n[WIFI] Connected");
 
-  // 1. Wipe Local Memory
-  total_intake = 0.0;
-  EEPROM.put(0, total_intake);
-  EEPROM.commit();
-  last_stable_weight = getWeightUnits(20); // Recalibrate baseline
+  // 2. Hardware Init
+  lcd.init(); lcd.backlight();
+  pinMode(LOADCELL_DOUT_PIN, INPUT);
+  pinMode(LOADCELL_SCK_PIN, OUTPUT);
+  EEPROM.begin(EEPROM_SIZE);
+  
+  // 3. TinyML Model Init
+  ml.begin(lithoflow_edge_tflite); 
 
-  // 2. Wipe Cloud Data
-  if (WiFi.status() == WL_CONNECTED) {
-    lcd.setCursor(0,1); lcd.print("Clearing Cloud...");
-    
-    // FIX: Use secure client for the HTTPS ngrok endpoint
-    WiFiClientSecure client;
-    client.setInsecure(); 
-    
-    HTTPClient http;
-    http.begin(client, resetServerName);
-    
-    int httpResponseCode = http.POST(""); // Empty body for POST
-    Serial.print("[CLOUD] Reset Response: "); Serial.println(httpResponseCode);
-    http.end();
-  }
-
-  lcd.setCursor(0,1); lcd.print("Reset Complete!  ");
+  // 4. Persistence Restore
+  EEPROM.get(0, total_intake);
+  if (isnan(total_intake)) total_intake = 0.0;
+  
+  // 5. Initial Tare (Zeroing)
+  long tare_sum = 0;
+  for(int i=0; i<20; i++) tare_sum += readHX711Raw();
+  zero_offset = tare_sum / 20;
+  last_stable_weight = getWeightUnits(30);
+  
+  lcd.print("RenalSense IoT");
   delay(1500);
   lcd.clear();
 }
 
-void setup() {
-  Serial.begin(115200);
-  
-  // Initialize Reset Button
-  pinMode(RESET_BTN_PIN, INPUT_PULLUP);
-  
-  // STAGE 1: Priority WiFi Boot
-  WiFi.disconnect(true);
-  delay(1000);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false); 
-  WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  // STAGE 2: Peripheral Init & Smart Calibration
-  if (WiFi.status() == WL_CONNECTED) {
-    lcd.init(); lcd.backlight();
-    pinMode(LOADCELL_DOUT_PIN, INPUT);
-    pinMode(LOADCELL_SCK_PIN, OUTPUT);
-    EEPROM.begin(EEPROM_SIZE);
-    
-    // Check for previous data
-    EEPROM.get(0, total_intake);
-    if (isnan(total_intake) || total_intake > 5000) total_intake = 0.0;
-
-    // A. Tare Empty Scale (Do NOT place bottle yet)
-    lcd.setCursor(0,0); lcd.print("Taring Scale...");
-    long tare_sum = 0;
-    for(int i=0; i<20; i++) tare_sum += readHX711Raw();
-    zero_offset = tare_sum / 20;
-
-    // B. Wait for Bottle Placement
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("Place Bottle Now");
-    float check_w = 0;
-    while(check_w < 50.0) { // Wait for at least 50g
-      check_w = getWeightUnits(10);
-      delay(500);
-      Serial.print("Waiting for bottle... Current: "); Serial.println(check_w);
-    }
-
-    // C. Lock Initial Baseline
-    delay(2000); // Let it settle
-    last_stable_weight = getWeightUnits(30);
-    lcd.clear();
-    lcd.print("Bottle Synced!");
-    delay(1500);
-  }
-}
-
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  float current_weight = getWeightUnits(10); 
 
-  // --- NEW: CHECK RESET BUTTON ---
-  if (digitalRead(RESET_BTN_PIN) == LOW) {
-    delay(50); // Debounce
-    if (digitalRead(RESET_BTN_PIN) == LOW) {
-      handlePhysicalReset();
-      return; // Skip rest of loop for this cycle
-    }
-  }
-
-  float current_reading = getWeightUnits(20); // Signal smoothing
-
-  // EDGE ANALYTICS: Lift Logic
-  if (current_reading < 25.0 && !is_lifting) { 
+  // Detect Lift (Bottle picked up)
+  if (current_weight < 20.0 && !is_lifting) { 
     is_lifting = true;
+    lift_start_time = millis();
     lcd.setCursor(0,1); lcd.print("Status: Drinking");
-    Serial.println(">>> Bottle Lifted");
   } 
 
-  // EDGE ANALYTICS: Replace Logic
-  if (current_reading > 45.0 && is_lifting) {
-    lcd.setCursor(0,1); lcd.print("Status: Syncing ");
-    delay(2000); // User requested 2s gap
+  // Detect Replacement (Bottle put back)
+  if (current_weight > 40.0 && is_lifting) {
+    delay(2000); // Wait for water oscillation to settle
+    float new_weight = getWeightUnits(25); 
+    float weight_drop = last_stable_weight - new_weight;
+    float duration = (millis() - lift_start_time) / 1000.0;
     
-    float new_weight = getWeightUnits(30); 
-    float consumed = last_stable_weight - new_weight;
-    
-    // Intake detected (positive change)
-    if (consumed > 8.0) { 
-      total_intake += consumed;
+    // --- EDGE AI INFERENCE ---
+    float inputs[2] = {weight_drop, duration};
+    float confidence = ml.predict(inputs);
+
+    Serial.printf("[ML] Drop: %.2fg | Time: %.2fs | Confidence: %.2f\n", weight_drop, duration, confidence);
+
+    // Classify: If confidence > 75% and weight drop is significant
+    if (confidence > 0.75 && weight_drop > 5.0) { 
+      total_intake += weight_drop;
+      
+      // Save to EEPROM (Persistence)
       EEPROM.put(0, total_intake);
       EEPROM.commit(); 
       
-      // FIX: Added the "hydration_event" tag here
-      sendDataToCloud(total_intake, consumed, "hydration_event");
+      // Sync to Cloud
+      sendDataToCloud(total_intake, weight_drop, "sip");
       
-      last_stable_weight = new_weight; // Update baseline to current water level
-    } 
-    // Refill detected (negative change > 50g)
-    else if (consumed < -50.0) {
-      Serial.println(">>> Refill Detected. Resetting Baseline.");
-      last_stable_weight = new_weight;
+      lcd.setCursor(0,1); lcd.print("Logged: +"); lcd.print((int)weight_drop); lcd.print("ml");
+    } else {
+      lcd.setCursor(0,1); lcd.print("Status: Ignored ");
     }
     
+    last_stable_weight = new_weight;
     is_lifting = false;
-    lcd.setCursor(0,1); lcd.print("Status: Ready   ");
+    delay(3000);
+    lcd.clear();
   }
 
-  // Dashboard Update
+  // Periodic Display
   lcd.setCursor(0, 0);
-  lcd.print("Intake: "); lcd.print(total_intake, 0); lcd.print("ml   ");
-  
-  if (!is_lifting) {
-    lcd.setCursor(0, 1);
-    lcd.print("Weight: "); lcd.print(current_reading, 0); lcd.print("g      ");
-  }
-  
-  delay(300);
+  lcd.print("Total: "); lcd.print((int)total_intake); lcd.print(" ml");
+  delay(200);
 }
